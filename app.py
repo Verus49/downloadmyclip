@@ -1,7 +1,7 @@
-from flask import Flask, request, Response, render_template_string, jsonify, send_from_directory
+from flask import Flask, request, Response
 import yt_dlp
-import requests
-import os
+import json
+import re
 
 app = Flask(__name__)
 
@@ -376,76 +376,60 @@ INDEX_HTML = """
 </html>
 """
 
-def get_direct_url(video_url, fmt):
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'format': 'bestaudio/best' if fmt == 'audio' else 'bestvideo+bestaudio/best',
-        'noplaylist': True,
-        'skip_download': True,
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(video_url, download=False)
-        if fmt == 'audio':
-            formats = info.get('formats', [])
-            audio_formats = [f for f in formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
-            if not audio_formats:
-                return info.get('url')
-            best_audio = sorted(audio_formats, key=lambda f: f.get('abr', 0), reverse=True)[0]
-            return best_audio['url']
-        else:
-            return info.get('url')
-
-
-@app.route('/', methods=['GET'])
+@app.route("/")
 def index():
-    return render_template_string(INDEX_HTML)
+    return INDEX_HTML
 
-@app.route('/stream', methods=['POST'])
+
+@app.route("/stream", methods=["POST"])
 def stream():
-    data = request.get_json(force=True)
-    url = data.get('url', '').strip()
-    fmt = data.get('format', 'video')
+    data = request.get_json()
+    url = data.get("url", "").strip()
+    format_choice = data.get("format", "video")
 
-    if not url:
-        return jsonify(error="No URL provided"), 400
-    if fmt not in ('video', 'audio'):
-        return jsonify(error="Invalid format"), 400
+    if not re.match(r"^https?://", url):
+        return json.dumps({"error": "Invalid URL"}), 400, {"Content-Type": "application/json"}
 
-    try:
-        direct_url = get_direct_url(url, fmt)
-    except Exception as e:
-        return jsonify(error=f"Failed to extract direct URL: {str(e)}"), 500
+    ydl_opts = {
+        "format": "bestaudio/best" if format_choice == "audio" else "bestvideo+bestaudio/best",
+        "quiet": True,
+        "no_warnings": True,
+        "outtmpl": "-",
+    }
 
-    if not direct_url:
-        return jsonify(error="Could not find direct media URL"), 404
+    if format_choice == "audio":
+        ydl_opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }]
 
     def generate():
-        try:
-            with requests.get(direct_url, stream=True, timeout=30) as r:
-                r.raise_for_status()
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        yield chunk
-        except Exception:
-            pass
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            try:
+                info = ydl.extract_info(url, download=False)
+                requested_url = info["url"]
+            except Exception as e:
+                yield json.dumps({"error": str(e)})
+                return
 
-    ext = 'mp3' if fmt == 'audio' else 'mp4'
-    filename = f"downloadmyclip.{ext}"
-    headers = {
-        'Content-Disposition': f'attachment; filename="{filename}"',
-        'Content-Type': 'audio/mpeg' if fmt == 'audio' else 'video/mp4',
-        'Cache-Control': 'no-cache',
-    }
-    return Response(generate(), headers=headers)
+        # Stream directly from source
+        import requests
+        with requests.get(requested_url, stream=True) as r:
+            r.raise_for_status()
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    yield chunk
 
-@app.route('/static/<path:filename>')
-def serve_static(filename):
-    # Serve static HTML pages for Contact, Terms, Privacy, About
-    static_dir = os.path.join(app.root_path, 'static')
-    return send_from_directory(static_dir, filename)
+    filename = "download." + ("mp3" if format_choice == "audio" else "mp4")
+    return Response(
+        generate(),
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Type": "audio/mpeg" if format_choice == "audio" else "video/mp4",
+        }
+    )
 
-if __name__ == '__main__':
-    import os
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host='0.0.0.0', port=port)
+
+if __name__ == "__main__":
+    app.run(debug=True)
