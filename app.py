@@ -417,20 +417,25 @@ def stream_video():
 
 
 def stream_direct(stream_url, format_type, filename=None):
-    # Fallback filename
     if not filename:
         path = urlparse(stream_url).path
         filename = path.split("/")[-1] or f"download.{ 'mp3' if format_type == 'audio' else 'mp4' }"
 
-    # Stream content in chunks
-    r = requests.get(stream_url, stream=True)
+    try:
+        r = requests.get(stream_url, stream=True, timeout=(5, None))
+    except requests.exceptions.RequestException as e:
+        return {"error": f"Failed to fetch media: {e}"}, 400
+
     if r.status_code != 200:
-        return {"error": f"Failed to fetch media: {r.status_code}"}, 400
+        return {"error": f"Failed to fetch media: HTTP {r.status_code}"}, 400
 
     def generate():
-        for chunk in r.iter_content(chunk_size=8192):
-            if chunk:
-                yield chunk
+        try:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    yield chunk
+        finally:
+            r.close()
 
     mime_type = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
     return Response(
@@ -441,6 +446,8 @@ def stream_direct(stream_url, format_type, filename=None):
         }
     )
 
+
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
+
 
