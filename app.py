@@ -1,12 +1,13 @@
 from flask import Flask, request, Response
 import yt_dlp
-import io
+import mimetypes
 import requests
 from urllib.parse import urlparse
-import mimetypes
+from yt_dlp.utils import DownloadError
 
 app = Flask(__name__)
 
+# --- FRONTEND (Instagram-inspired, your original HTML) ---
 INDEX_HTML = """
 <!DOCTYPE html>
 <html lang="en" >
@@ -377,67 +378,33 @@ INDEX_HTML = """
 </body>
 </html>
 """
-@app.route('/')
+
+@app.route("/")
 def index():
-    return INDEX_HTML
+    return HTML_PAGE
 
-@app.route('/stream', methods=['POST'])
-def stream_video():
-    data = request.get_json()
-    url = data.get('url', '').strip()
-    format_type = data.get('format', 'video')
 
-    if not url:
-        return {"error": "No URL provided"}, 400
+# --- Direct streaming for MP4/video URLs ---
+def stream_direct(url):
+    path = urlparse(url).path
+    filename = path.split("/")[-1] or "video.mp4"
+    mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
     try:
-        # Check if it's a direct file (e.g., ends with .mp4, .webm, etc.)
-        parsed = urlparse(url)
-        if parsed.path.lower().endswith(('.mp4', '.webm', '.mkv', '.mov', '.avi')):
-            return stream_direct(url, format_type)
-
-        # Otherwise, use yt-dlp to extract stream URL
-        ydl_opts = {
-            'format': 'bestaudio/best' if format_type == 'audio' else 'best',
-            'quiet': True,
-            'no_warnings': True,
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            stream_url = info.get('url')
-            filename = (info.get('title') or "download").replace(" ", "_")
-            ext = 'mp3' if format_type == 'audio' else info.get('ext', 'mp4')
-            filename = f"{filename}.{ext}"
-        
-        return stream_direct(stream_url, format_type, filename)
-
-    except Exception as e:
-        return {"error": str(e)}, 500
-
-
-def stream_direct(stream_url, format_type, filename=None):
-    if not filename:
-        path = urlparse(stream_url).path
-        filename = path.split("/")[-1] or f"download.{ 'mp3' if format_type == 'audio' else 'mp4' }"
-
-    try:
-        r = requests.get(stream_url, stream=True, timeout=(5, None))
-    except requests.exceptions.RequestException as e:
-        return {"error": f"Failed to fetch media: {e}"}, 400
-
-    if r.status_code != 200:
-        return {"error": f"Failed to fetch media: HTTP {r.status_code}"}, 400
+        r = requests.get(url, stream=True, timeout=(5, None))
+        r.raise_for_status()
+    except requests.RequestException as e:
+        return Response(f"❌ Failed to fetch: {e}", status=400)
 
     def generate():
-        try:
-            for chunk in r.iter_content(chunk_size=8192):
-                if chunk:
-                    yield chunk
-        finally:
-            r.close()
+        first = True
+        for chunk in r.iter_content(chunk_size=8192):
+            if chunk:
+                if first:
+                    first = False
+                yield chunk
+        r.close()
 
-    mime_type = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
     return Response(
         generate(),
         headers={
@@ -447,7 +414,42 @@ def stream_direct(stream_url, format_type, filename=None):
     )
 
 
-if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+# --- yt-dlp streaming ---
+def stream_ytdlp(url):
+    ydl_opts = {
+        "format": "bestvideo+bestaudio/best",
+        "quiet": True,
+        "nocheckcertificate": True,
+        "noplaylist": True,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            formats = info.get("formats", [info])
+            stream_url = next((f["url"] for f in formats if f.get("url")), None)
+            if not stream_url:
+                return Response("❌ No downloadable stream found.", status=400)
+    except DownloadError as e:
+        return Response(f"❌ Unable to download: {e}", status=400)
+    except Exception as e:
+        return Response(f"❌ Unexpected error: {e}", status=500)
+
+    return stream_direct(stream_url)
 
 
+@app.route("/stream", methods=["POST"])
+def stream():
+    url = request.form.get("url", "").strip()
+    if not url:
+        return Response("❌ No URL provided.", status=400)
+
+    ext = urlparse(url).path.lower()
+    if ext.endswith((".mp4", ".webm", ".mov", ".mkv", ".m3u8")):
+        return stream_direct(url)
+    else:
+        return stream_ytdlp(url)
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
