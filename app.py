@@ -1,13 +1,10 @@
 from flask import Flask, request, Response
 import yt_dlp
-import mimetypes
-import requests
-from urllib.parse import urlparse
-from yt_dlp.utils import DownloadError
+import json
+import re
 
 app = Flask(__name__)
 
-# --- FRONTEND (Instagram-inspired, your original HTML) ---
 INDEX_HTML = """
 <!DOCTYPE html>
 <html lang="en" >
@@ -379,77 +376,61 @@ INDEX_HTML = """
 </html>
 """
 
+
 @app.route("/")
 def index():
-    return HTML_PAGE
-
-
-# --- Direct streaming for MP4/video URLs ---
-def stream_direct(url):
-    path = urlparse(url).path
-    filename = path.split("/")[-1] or "video.mp4"
-    mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-
-    try:
-        r = requests.get(url, stream=True, timeout=(5, None))
-        r.raise_for_status()
-    except requests.RequestException as e:
-        return Response(f"❌ Failed to fetch: {e}", status=400)
-
-    def generate():
-        first = True
-        for chunk in r.iter_content(chunk_size=8192):
-            if chunk:
-                if first:
-                    first = False
-                yield chunk
-        r.close()
-
-    return Response(
-        generate(),
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Content-Type": mime_type
-        }
-    )
-
-
-# --- yt-dlp streaming ---
-def stream_ytdlp(url):
-    ydl_opts = {
-        "format": "bestvideo+bestaudio/best",
-        "quiet": True,
-        "nocheckcertificate": True,
-        "noplaylist": True,
-    }
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            formats = info.get("formats", [info])
-            stream_url = next((f["url"] for f in formats if f.get("url")), None)
-            if not stream_url:
-                return Response("❌ No downloadable stream found.", status=400)
-    except DownloadError as e:
-        return Response(f"❌ Unable to download: {e}", status=400)
-    except Exception as e:
-        return Response(f"❌ Unexpected error: {e}", status=500)
-
-    return stream_direct(stream_url)
+    return INDEX_HTML
 
 
 @app.route("/stream", methods=["POST"])
 def stream():
-    url = request.form.get("url", "").strip()
-    if not url:
-        return Response("❌ No URL provided.", status=400)
+    data = request.get_json()
+    url = data.get("url", "").strip()
+    format_choice = data.get("format", "video")
 
-    ext = urlparse(url).path.lower()
-    if ext.endswith((".mp4", ".webm", ".mov", ".mkv", ".m3u8")):
-        return stream_direct(url)
-    else:
-        return stream_ytdlp(url)
+    if not re.match(r"^https?://", url):
+        return json.dumps({"error": "Invalid URL"}), 400, {"Content-Type": "application/json"}
+
+    ydl_opts = {
+        "format": "bestaudio/best" if format_choice == "audio" else "bestvideo+bestaudio/best",
+        "quiet": True,
+        "no_warnings": True,
+        "outtmpl": "-",
+    }
+
+    if format_choice == "audio":
+        ydl_opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }]
+
+    def generate():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            try:
+                info = ydl.extract_info(url, download=False)
+                requested_url = info["url"]
+            except Exception as e:
+                yield json.dumps({"error": str(e)})
+                return
+
+        # Stream directly from source
+        import requests
+        with requests.get(requested_url, stream=True) as r:
+            r.raise_for_status()
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    yield chunk
+
+    filename = "download." + ("mp3" if format_choice == "audio" else "mp4")
+    return Response(
+        generate(),
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Type": "audio/mpeg" if format_choice == "audio" else "video/mp4",
+        }
+    )
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(debug=True)
