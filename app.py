@@ -1,7 +1,9 @@
 from flask import Flask, request, Response
 import yt_dlp
+import io
 import requests
-import re
+from urllib.parse import urlparse
+import mimetypes
 
 app = Flask(__name__)
 
@@ -375,78 +377,70 @@ INDEX_HTML = """
 </body>
 </html>
 """
-
-VIDEO_PATTERN = re.compile(r".*\.(mp4|webm|mkv|mov|m3u8)(\?.*)?$", re.IGNORECASE)
-
 @app.route('/')
 def index():
-    return HTML_PAGE
+    return INDEX_HTML
 
-@app.route('/download')
-def download():
-    url = request.args.get('url')
-    download_type = request.args.get('type', 'video')
+@app.route('/stream', methods=['POST'])
+def stream_video():
+    data = request.get_json()
+    url = data.get('url', '').strip()
+    format_type = data.get('format', 'video')
 
     if not url:
-        return "No URL provided", 400
+        return {"error": "No URL provided"}, 400
 
     try:
-        if VIDEO_PATTERN.match(url):
-            # Direct file streaming
-            return stream_direct(url, download_type)
-        else:
-            # Use yt-dlp
-            return stream_ytdlp(url, download_type)
+        # Check if it's a direct file (e.g., ends with .mp4, .webm, etc.)
+        parsed = urlparse(url)
+        if parsed.path.lower().endswith(('.mp4', '.webm', '.mkv', '.mov', '.avi')):
+            return stream_direct(url, format_type)
+
+        # Otherwise, use yt-dlp to extract stream URL
+        ydl_opts = {
+            'format': 'bestaudio/best' if format_type == 'audio' else 'best',
+            'quiet': True,
+            'no_warnings': True,
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            stream_url = info.get('url')
+            filename = (info.get('title') or "download").replace(" ", "_")
+            ext = 'mp3' if format_type == 'audio' else info.get('ext', 'mp4')
+            filename = f"{filename}.{ext}"
+        
+        return stream_direct(stream_url, format_type, filename)
+
     except Exception as e:
-        return f"Error: {str(e)}", 500
+        return {"error": str(e)}, 500
 
-def stream_direct(url, download_type):
-    r = requests.get(url, stream=True)
+
+def stream_direct(stream_url, format_type, filename=None):
+    # Fallback filename
+    if not filename:
+        path = urlparse(stream_url).path
+        filename = path.split("/")[-1] or f"download.{ 'mp3' if format_type == 'audio' else 'mp4' }"
+
+    # Stream content in chunks
+    r = requests.get(stream_url, stream=True)
     if r.status_code != 200:
-        return f"Failed to fetch file: {r.status_code}", 400
-
-    content_type = 'video/mp4' if download_type == 'video' else 'audio/mpeg'
-    filename = 'download.mp4' if download_type == 'video' else 'download.mp3'
-
-    return Response(
-        r.iter_content(chunk_size=8192),
-        content_type=content_type,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-    )
-
-def stream_ytdlp(url, download_type):
-    ydl_opts = {
-        'format': 'bestaudio/best' if download_type == 'audio' else 'best',
-        'quiet': True,
-        'noplaylist': True,
-        'outtmpl': '-',
-    }
-    if download_type == 'audio':
-        ydl_opts.update({
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }]
-        })
+        return {"error": f"Failed to fetch media: {r.status_code}"}, 400
 
     def generate():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            result = ydl.extract_info(url, download=False)
-            direct_url = result['url']
-            r = requests.get(direct_url, stream=True)
-            for chunk in r.iter_content(chunk_size=8192):
+        for chunk in r.iter_content(chunk_size=8192):
+            if chunk:
                 yield chunk
 
-    content_type = 'audio/mpeg' if download_type == 'audio' else 'video/mp4'
-    filename = 'download.mp3' if download_type == 'audio' else 'download.mp4'
-
+    mime_type = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
     return Response(
         generate(),
-        content_type=content_type,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Type": mime_type
+        }
     )
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    app.run(debug=True, port=5000)
 
