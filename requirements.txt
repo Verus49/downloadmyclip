@@ -1,0 +1,5 @@
+flask
+yt-dlp
+ffmpeg-python
+requests
+gunicorn
