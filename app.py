@@ -1,24 +1,20 @@
-from flask import Flask, request, Response, render_template_string, jsonify, send_from_directory
-import yt_dlp
-import requests
+from __future__ import annotations
+
 import os
 import re
-from urllib.parse import urlparse, unquote
+import shutil
+import tempfile
+import time
+import uuid
+from pathlib import Path
+from urllib.parse import unquote
 
-app = Flask(__name__)
+from flask import Flask, jsonify, render_template_string, request, send_file
+import yt_dlp
 
-# ---- Config ----
-DIRECT_VIDEO_EXTS = ('.mp4', '.webm', '.mkv', '.mov')
-DIRECT_AUDIO_EXTS = ('.mp3', '.m4a', '.aac', '.wav', '.ogg')
-DEFAULT_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/115.0 Safari/537.36"
-)
-REQUEST_TIMEOUT = (10, 30)  # (connect, read) seconds
-CHUNK = 1024 * 256  # 256 KB
-
-# ---- HTML (kept, lightly polished) ----
+# =============================================================================
+# Frontend (kept exactly as you sent)
+# =============================================================================
 INDEX_HTML = """
 <!DOCTYPE html>
 <html lang="en" >
@@ -31,53 +27,235 @@ INDEX_HTML = """
   <meta name="robots" content="index, follow" />
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap');
-    * { box-sizing: border-box; }
+
+    /* Reset & base */
+    * {
+      box-sizing: border-box;
+    }
     body {
-      margin: 0; background: #000; color: #fff; font-family: 'Inter', sans-serif;
-      line-height: 1.5; min-height: 100vh; display: flex; flex-direction: column;
-      -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+      margin: 0;
+      background: #000;
+      color: #fff;
+      font-family: 'Inter', sans-serif;
+      font-weight: 400;
+      line-height: 1.5;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
     }
-    a { color: inherit; text-decoration: none; }
+    a {
+      color: inherit;
+      text-decoration: none;
+    }
+
+    /* Nav */
     nav {
-      display: flex; gap: 1.25rem; font-weight: 700; font-size: 0.95rem;
-      border-bottom: 1px solid #222; padding: 1rem 1.25rem; background: #000;
-      justify-content: center; flex-wrap: wrap; user-select: none;
-      position: sticky; top: 0; z-index: 10;
+      display: flex;
+      gap: 2rem;
+      font-weight: 700;
+      font-size: 1rem;
+      border-bottom: 1px solid #222;
+      padding: 1rem 2rem;
+      background: #000;
+      justify-content: center;
+      flex-wrap: wrap;
+      user-select: none;
     }
-    nav a { padding-bottom: 4px; border-bottom: 3px solid transparent; transition: border-color .2s; }
-    nav a:hover, nav a:focus { border-bottom-color: #fff; outline: none; }
-    main { flex: 1; max-width: 640px; margin: 2rem auto 4rem; padding: 0 1rem; display: flex; flex-direction: column; align-items: center; }
-    h1 { font-weight: 900; font-size: clamp(2.2rem, 5vw, 3rem); letter-spacing: 0.06em; margin-bottom: 1.5rem; user-select: none; text-align: center; }
-    form { width: 100%; display: flex; flex-direction: column; gap: 1rem; }
+    nav a {
+      padding-bottom: 4px;
+      border-bottom: 3px solid transparent;
+      transition: border-color 0.3s ease;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    nav a:hover,
+    nav a:focus {
+      border-bottom-color: #fff;
+      outline: none;
+    }
+
+    /* Main container */
+    main {
+      flex: 1;
+      max-width: 600px;
+      margin: 2rem auto 4rem;
+      padding: 0 1rem;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    h1 {
+      font-weight: 900;
+      font-size: 3rem;
+      letter-spacing: 0.1em;
+      margin-bottom: 2rem;
+      user-select: none;
+      text-align: center;
+    }
+
+    form {
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 1.25rem;
+    }
+
     input[type="url"] {
-      background: #0b0b0b; border: 2px solid #2b2b2b; color: #fff; padding: 1rem 1.1rem;
-      font-size: 1.05rem; border-radius: 10px; transition: border-color .2s, box-shadow .2s;
+      background: transparent;
+      border: 2px solid #444;
+      color: #fff;
+      padding: 1rem 1.25rem;
+      font-size: 1.1rem;
+      border-radius: 6px;
+      transition: border-color 0.3s ease;
+      outline-offset: 2px;
     }
-    input[type="url"]::placeholder { color: #888; }
-    input[type="url"]:focus { border-color: #fff; outline: none; box-shadow: 0 0 0 4px #ffffff1a; }
-    .format-select { display: flex; justify-content: center; gap: 1.5rem; font-weight: 700; color: #bbb; user-select: none; }
-    .format-select label { cursor: pointer; font-size: 0.95rem; }
-    .format-select input[type="radio"] { accent-color: #fff; margin-right: .5rem; cursor: pointer; width: 18px; height: 18px; vertical-align: middle; }
+    input[type="url"]:focus {
+      border-color: #fff;
+      outline: none;
+    }
+
+    .format-select {
+      display: flex;
+      justify-content: center;
+      gap: 2rem;
+      font-weight: 700;
+      color: #bbb;
+      user-select: none;
+    }
+    .format-select label {
+      cursor: pointer;
+      font-size: 1rem;
+    }
+    .format-select input[type="radio"] {
+      accent-color: #fff;
+      margin-right: 0.5rem;
+      cursor: pointer;
+      width: 18px;
+      height: 18px;
+      vertical-align: middle;
+    }
+
     button[type="submit"] {
-      background: #fff; color: #000; font-weight: 900; padding: 1rem 0; border: none;
-      border-radius: 10px; cursor: pointer; font-size: 1.15rem; user-select: none;
-      transition: transform .05s ease, background-color .2s; box-shadow: 0 0 12px #fff4;
+      background: #fff;
+      color: #000;
+      font-weight: 900;
+      padding: 1rem 0;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 1.25rem;
+      user-select: none;
+      transition: background-color 0.3s ease;
+      box-shadow: 0 0 8px #fff5;
     }
-    button[type="submit"]:active { transform: translateY(1px); }
-    button[type="submit"]:hover, button[type="submit"]:focus { background: #e6e6e6; outline: none; }
+    button[type="submit"]:hover,
+    button[type="submit"]:focus {
+      background: #ddd;
+      outline: none;
+    }
+
     #loading {
-      margin-top: .6rem; display: flex; align-items: center; justify-content: center; gap: .6rem;
-      color: #fff; font-weight: 700; font-size: .95rem; user-select: none; visibility: hidden; opacity: 0; transition: opacity .2s;
+      margin-top: 1.2rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.8rem;
+      color: #fff;
+      font-weight: 700;
+      font-size: 1rem;
+      user-select: none;
+      visibility: hidden;
+      opacity: 0;
+      transition: opacity 0.3s ease;
     }
-    #loading.active { visibility: visible; opacity: 1; }
-    #message { margin-top: .75rem; min-height: 1.3rem; color: #ff6666; font-weight: 700; text-align: center; user-select: none; }
-    .spinner { width: 22px; height: 22px; border: 3px solid #fff; border-top: 3px solid transparent; border-radius: 50%; animation: spin 1s linear infinite; }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    footer { background: #111; text-align: center; padding: 1rem; font-size: .85rem; color: #888; user-select: none; border-top: 1px solid #222; }
-    footer nav a { color: #888; margin: 0 10px; font-weight: 700; transition: color .2s; }
-    footer nav a:hover, footer nav a:focus { color: #fff; outline: none; }
-    .ads { margin: 2rem 0; display: flex; justify-content: center; gap: 1rem; flex-wrap: wrap; }
-    .ad-slot { background: #171717; padding: 1rem 1.25rem; border-radius: 10px; color: #666; font-size: .85rem; user-select: none; min-width: 260px; text-align: center; box-shadow: 0 0 6px #fff2; }
+    #loading.active {
+      visibility: visible;
+      opacity: 1;
+    }
+
+    #message {
+      margin-top: 1rem;
+      min-height: 1.3rem;
+      color: #ff5555;
+      font-weight: 600;
+      text-align: center;
+      user-select: none;
+    }
+
+    .spinner {
+      width: 24px;
+      height: 24px;
+      border: 3px solid #fff;
+      border-top: 3px solid transparent;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    /* Footer */
+    footer {
+      background: #111;
+      text-align: center;
+      padding: 1rem 1rem;
+      font-size: 0.85rem;
+      color: #888;
+      user-select: none;
+      border-top: 1px solid #222;
+    }
+    footer nav a {
+      color: #888;
+      margin: 0 10px;
+      text-decoration: none;
+      font-weight: 700;
+      cursor: pointer;
+      transition: color 0.3s ease;
+    }
+    footer nav a:hover,
+    footer nav a:focus {
+      color: #fff;
+      outline: none;
+    }
+
+    /* Ads placeholders */
+    .ads {
+      margin: 2rem 0;
+      display: flex;
+      justify-content: center;
+      gap: 1rem;
+      flex-wrap: wrap;
+    }
+    .ad-slot {
+      background: #222;
+      padding: 1rem 1.5rem;
+      border-radius: 8px;
+      color: #666;
+      font-size: 0.85rem;
+      user-select: none;
+      min-width: 280px;
+      text-align: center;
+      box-shadow: 0 0 6px #fff2;
+    }
+
+    @media (max-width: 640px) {
+      nav {
+        gap: 1rem;
+        padding: 1rem;
+      }
+      .ads {
+        flex-direction: column;
+        gap: 1rem;
+        margin: 1.5rem 0;
+      }
+      .ad-slot {
+        min-width: 100%;
+      }
+    }
   </style>
 </head>
 <body>
@@ -94,7 +272,15 @@ INDEX_HTML = """
 <main>
   <h1>DownloadMyClip</h1>
   <form id="downloadForm" novalidate>
-    <input type="url" name="url" id="urlInput" placeholder="Paste video or audio URL here (MP4, MP3, social links…)" required autocomplete="off" aria-label="Video URL input"/>
+    <input
+      type="url"
+      name="url"
+      id="urlInput"
+      placeholder="Paste video URL here"
+      required
+      autocomplete="off"
+      aria-label="Video URL input"
+    />
     <div class="format-select" role="radiogroup" aria-label="Choose download format">
       <label><input type="radio" name="format" value="video" checked /> Video (MP4)</label>
       <label><input type="radio" name="format" value="audio" /> Audio (MP3)</label>
@@ -154,32 +340,31 @@ INDEX_HTML = """
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({url, format}),
     })
-    .then(async (response) => {
+    .then(response => {
       loading.classList.remove('active');
       loading.setAttribute('aria-hidden', 'true');
       downloadBtn.disabled = false;
 
       if (!response.ok) {
-        const data = await response.json().catch(() => ({}));
-        throw new Error(data.error || 'Download failed');
+        return response.json().then(data => { throw new Error(data.error || 'Download failed'); });
       }
       const disposition = response.headers.get('Content-Disposition');
-      const ct = response.headers.get('Content-Type') || '';
-      const isAudio = ct.includes('audio');
-      let filename = 'download.' + (isAudio ? 'mp3' : 'mp4');
+      let filename = 'download.' + (format === 'audio' ? 'mp3' : 'mp4');
       if (disposition) {
-        const match = disposition.match(/filename\\*=UTF-8''([^;]+)|filename=\"?([^\";]+)\"?/);
-        if (match) filename = decodeURIComponent(match[1] || match[2]);
+        const match = disposition.match(/filename="?([^"]+)"?/);
+        if (match && match[1]) filename = match[1];
       }
-      const blob = await response.blob();
-      const dlUrl = window.URL.createObjectURL(blob);
+      return response.blob().then(blob => ({blob, filename}));
+    })
+    .then(({blob, filename}) => {
+      const url = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = dlUrl;
+      a.href = url;
       a.download = filename;
       document.body.appendChild(a);
       a.click();
       a.remove();
-      window.URL.revokeObjectURL(dlUrl);
+      window.URL.revokeObjectURL(url);
     })
     .catch(err => {
       loading.classList.remove('active');
@@ -190,7 +375,8 @@ INDEX_HTML = """
   });
 
   function openPopup(url, title) {
-    const width = 600, height = 600;
+    const width = 600;
+    const height = 600;
     const left = (screen.width / 2) - (width / 2);
     const top = (screen.height / 2) - (height / 2);
     window.open(url, title, `width=${width},height=${height},top=${top},left=${left},resizable=yes,scrollbars=yes`);
@@ -200,201 +386,220 @@ INDEX_HTML = """
 </html>
 """
 
-# ---------- Helpers ----------
+# =============================================================================
+# Backend
+# =============================================================================
 
-def valid_url(url: str) -> bool:
-    try:
-        p = urlparse(url)
-        return p.scheme in ("http", "https") and bool(p.netloc)
-    except Exception:
-        return False
+app = Flask(__name__)
 
-def is_direct_media(url: str, fmt: str) -> bool:
-    u = url.lower()
-    if fmt == "audio":
-        return u.endswith(DIRECT_AUDIO_EXTS)
-    # prefer progressive MP4/WebM/etc for video
-    return u.endswith(DIRECT_VIDEO_EXTS)
+DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0 Safari/537.36"
+)
 
-def filename_from_url(url: str, fallback: str) -> str:
-    try:
-        path = urlparse(url).path
-        name = os.path.basename(path)
-        name = unquote(name)
-        if name and re.search(r"\\.[a-z0-9]{2,5}$", name, re.I):
-            return sanitize_filename(name)
-    except Exception:
-        pass
-    return sanitize_filename(fallback)
+SAFE_VIDEO_EXTS = {"mp4", "webm", "mkv", "mov"}
+SAFE_AUDIO_EXTS = {"mp3", "m4a", "webm", "opus", "aac", "wav", "ogg"}
+
+# ---------- utils ----------
 
 def sanitize_filename(name: str) -> str:
-    name = re.sub(r"[\\/:*?\"<>|]+", "_", name)
+    name = unquote(name or "").strip()
+    name = re.sub(r'[\\/:*?"<>|]+', "_", name)
     name = name.strip().strip(".")
     return name or "download"
 
-def pick_best_format(info: dict, want_audio: bool):
+def _guess_mime(ext: str) -> str:
+    ext = (ext or "").lower()
+    return {
+        "mp4": "video/mp4",
+        "webm": "video/webm",
+        "mkv": "video/x-matroska",
+        "mov": "video/quicktime",
+        "mp3": "audio/mpeg",
+        "m4a": "audio/mp4",
+        "aac": "audio/aac",
+        "opus": "audio/opus",
+        "ogg": "audio/ogg",
+        "wav": "audio/wav",
+    }.get(ext, "application/octet-stream")
+
+def _make_tmpdir() -> Path:
+    base = Path(os.getenv("TMPDIR", "/tmp"))
+    d = base / f"dmc_{uuid.uuid4().hex}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+def _cleanup_dir(path: Path):
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
+
+# ---------- yt-dlp helpers ----------
+
+def download_with_ytdlp(url: str, want_audio: bool) -> tuple[Path, str, str]:
     """
-    Choose a progressive (single-file) format if possible (prefer mp4/m4a).
-    Fallback to yt-dlp's top URL otherwise.
+    Download the media into a temp folder and return:
+        (filepath, download_filename, mimetype)
+
+    - For video: prefer progressive MP4 when available.
+    - For audio: prefer MP3 if ffmpeg is present; otherwise keep source bestaudio.
     """
-    fmts = info.get("formats") or []
-    if not fmts:
-        return info.get("url"), info.get("ext") or ("mp3" if want_audio else "mp4"), info.get("acodec"), info.get("vcodec")
+    tmpdir = _make_tmpdir()
+    started = time.time()
 
-    # Filter for progressive single-file formats (no separate video/audio)
-    progressive = []
-    for f in fmts:
-        vcodec = f.get("vcodec")
-        acodec = f.get("acodec")
-        if want_audio:
-            if (acodec and acodec != "none") and (not vcodec or vcodec == "none"):
-                progressive.append(f)
-        else:
-            # Prefer formats that have both audio and video (vcodec != none and acodec != none)
-            if (vcodec and vcodec != "none") and (acodec and acodec != "none"):
-                progressive.append(f)
+    # Build output pattern safely
+    # - Use home paths to keep files inside tmpdir
+    # - Keep titles but sanitize later for download name
+    outtmpl = "%(title).200B.%(ext)s"
 
-    def score(f):
-        # prefer mp4/m4a, higher tbr/abr, https
-        ext = (f.get("ext") or "").lower()
-        bonus = 0
-        if want_audio and ext in ("m4a", "mp3", "aac"):
-            bonus += 50
-        if not want_audio and ext in ("mp4", "webm"):
-            bonus += 50
-        if (f.get("protocol") or "").startswith("https"):
-            bonus += 5
-        return (f.get("tbr") or f.get("abr") or 0) + bonus
-
-    best = None
-    if progressive:
-        best = max(progressive, key=score)
-    else:
-        # fallback: let yt-dlp decide (best/bestaudio)
-        best = max(fmts, key=lambda f: f.get("tbr") or f.get("abr") or 0)
-
-    return best.get("url"), best.get("ext") or ("mp3" if want_audio else "mp4"), best.get("acodec"), best.get("vcodec")
-
-def get_via_ytdlp(source_url: str, fmt: str):
-    """Use yt-dlp to extract a direct media URL suitable for streaming."""
-    want_audio = (fmt == "audio")
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "skip_download": True,
+        "restrictfilenames": False,
+        "windowsfilenames": False,
+        "geo_bypass": True,
         "http_headers": {"User-Agent": DEFAULT_UA, "Accept-Language": "en-US,en;q=0.9"},
-        "extractor_args": {"youtube": {"player_client": ["web"]}},
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(source_url, download=False)
-        # When yt-dlp gives a top-level URL, use that; else choose format.
-        if want_audio:
-            direct_url, ext, ac, vc = pick_best_format(info, want_audio=True)
-            filename_base = info.get("title") or "downloadmyclip"
-            return direct_url, f"{sanitize_filename(filename_base)}.mp3", "audio/mpeg"
-        else:
-            direct_url, ext, ac, vc = pick_best_format(info, want_audio=False)
-            # prefer mp4 naming
-            ext_final = "mp4" if (ext or "").lower() not in ("mp4", "webm") else ext.lower()
-            filename_base = info.get("title") or "downloadmyclip"
-            content_type = "video/mp4" if ext_final == "mp4" else "video/webm"
-            return direct_url, f"{sanitize_filename(filename_base)}.{ext_final}", content_type
-
-def proxy_stream(direct_url: str, filename: str, content_type: str, referer: str = None):
-    """
-    Stream bytes from direct_url to the client, passing Range through for seeking.
-    """
-    headers = {"User-Agent": DEFAULT_UA}
-    if referer:
-        headers["Referer"] = referer
-
-    # Pass Range header for partial requests (seeking)
-    range_header = request.headers.get("Range")
-    if range_header:
-        headers["Range"] = range_header
-
-    # Use stream=True and don't buffer whole file
-    upstream = requests.get(direct_url, headers=headers, stream=True, timeout=REQUEST_TIMEOUT)
-
-    # Determine status (200 or 206) and length
-    status = upstream.status_code
-    resp_headers = {
-        "Content-Type": content_type,
-        "Content-Disposition": f"attachment; filename*=UTF-8''{requests.utils.requote_uri(filename)}",
-        "Cache-Control": "no-cache",
+        "paths": {"home": str(tmpdir)},
+        "outtmpl": {"default": outtmpl},
+        # prevent super-high codecs that need merging where possible
+        "merge_output_format": "mp4" if not want_audio else None,
+        "retries": 3,
+        "concurrent_fragment_downloads": 1,
     }
 
-    # Pass through size and range info if available
-    if "Content-Length" in upstream.headers:
-        resp_headers["Content-Length"] = upstream.headers["Content-Length"]
-    if "Accept-Ranges" in upstream.headers:
-        resp_headers["Accept-Ranges"] = upstream.headers["Accept-Ranges"]
+    if want_audio:
+        # Try to convert to mp3 if ffmpeg exists; otherwise keep bestaudio
+        ydl_opts["format"] = "bestaudio/best"
+        # Postprocessor will be attempted; if ffmpeg missing, yt-dlp will skip with warning.
+        ydl_opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }]
     else:
-        # Many CDNs support it even if not declared; be conservative:
-        resp_headers["Accept-Ranges"] = "bytes"
-    if "Content-Range" in upstream.headers:
-        resp_headers["Content-Range"] = upstream.headers["Content-Range"]
+        # Prefer progressive MP4 with audio+video combined; fallback to best
+        # The following tries common progressive variants first.
+        ydl_opts["format"] = (
+            "bestvideo[ext=mp4][vcodec~='^((?!av01|vp9).)*$'][height<=1080]+bestaudio[ext=m4a]/"
+            "best[ext=mp4]/best"
+        )
 
-    def generate():
-        try:
-            for chunk in upstream.iter_content(chunk_size=CHUNK):
-                if chunk:
-                    yield chunk
-        finally:
-            upstream.close()
+    # Do the download
+    info = None
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+    except yt_dlp.utils.DownloadError as e:
+        _cleanup_dir(tmpdir)
+        # surface the actual message string
+        raise RuntimeError(f"{str(e).strip()}")
 
-    return Response(generate(), headers=resp_headers, status=status)
+    # Find the resulting file (the largest, newest one in tmpdir)
+    candidates = sorted(
+        (p for p in tmpdir.rglob("*") if p.is_file()),
+        key=lambda p: (p.stat().st_mtime, p.stat().st_size),
+        reverse=True,
+    )
 
-# ---------- Routes ----------
+    if not candidates:
+        _cleanup_dir(tmpdir)
+        raise RuntimeError("Download completed but no file was produced.")
 
-@app.route('/', methods=['GET'])
+    # Pick the best candidate with a safe extension
+    chosen: Path | None = None
+    for p in candidates:
+        ext = p.suffix.lower().lstrip(".")
+        if want_audio and ext in SAFE_AUDIO_EXTS:
+            chosen = p
+            break
+        if not want_audio and ext in SAFE_VIDEO_EXTS:
+            chosen = p
+            break
+    # fallback to most recent file
+    if chosen is None:
+        chosen = candidates[0]
+
+    # Build a nice download name
+    title = sanitize_filename((info.get("title") or "download").strip())
+    ext = chosen.suffix.lstrip(".").lower()
+    # If audio wanted but conversion didn’t happen, we’ll serve whatever ext we have
+    dl_name = f"{title}.{ext}"
+    mime = _guess_mime(ext)
+
+    return chosen, dl_name, mime
+
+# =============================================================================
+# Routes
+# =============================================================================
+
+@app.route("/", methods=["GET"])
 def index():
     return render_template_string(INDEX_HTML)
 
-@app.route('/stream', methods=['POST'])
-def stream():
-    data = request.get_json(force=True) or {}
-    url = (data.get('url') or '').strip()
-    fmt = (data.get('format') or 'video').strip().lower()
+@app.route("/healthz")
+def healthz():
+    return "ok", 200
 
-    if not url or not valid_url(url):
+@app.route("/stream", methods=["POST"])
+def stream():
+    data = request.get_json(silent=True) or {}
+    url = (data.get("url") or "").strip()
+    fmt = (data.get("format") or "video").strip().lower()
+
+    if not url or not re.match(r"^https?://", url):
         return jsonify(error="Please enter a valid http(s) URL."), 400
-    if fmt not in ('video', 'audio'):
+    if fmt not in {"video", "audio"}:
         return jsonify(error="Invalid format; choose video or audio."), 400
 
-    # 1) Direct link? stream without yt-dlp
-    if is_direct_media(url, fmt):
-        # Guess content-type & filename
-        is_audio = (fmt == "audio") or url.lower().endswith(DIRECT_AUDIO_EXTS)
-        content_type = "audio/mpeg" if is_audio else "video/mp4"
-        default_name = "downloadmyclip.mp3" if is_audio else "downloadmyclip.mp4"
-        filename = filename_from_url(url, default_name)
-        return proxy_stream(url, filename, content_type, referer=url)
+    want_audio = (fmt == "audio")
 
-    # 2) Not direct → use yt-dlp to extract best streamable URL
     try:
-        direct_url, filename, content_type = get_via_ytdlp(url, fmt)
-    except yt_dlp.utils.DownloadError as e:
-        # Specific yt-dlp error
-        return jsonify(error=f"Could not extract media from this link: {e.exc_info[1] if hasattr(e, 'exc_info') else str(e)}"), 400
+        filepath, dl_name, mime = download_with_ytdlp(url, want_audio=want_audio)
     except Exception as e:
-        return jsonify(error=f"Failed to process URL: {str(e)}"), 500
+        msg = str(e)
+        # Common opaque yt-dlp error → simplify for users
+        if "This content isn’t available" in msg or "Video unavailable" in msg:
+            return jsonify(error="This video is unavailable or blocked in your region."), 400
+        return jsonify(error=f"Could not download this link: {msg}"), 400
 
-    # Safety fallback filename/content-type
-    if not filename:
-        filename = "downloadmyclip.mp3" if fmt == "audio" else "downloadmyclip.mp4"
-    if not content_type:
-        content_type = "audio/mpeg" if fmt == "audio" else "video/mp4"
+    # Stream file to client, then remove temp directory afterwards.
+    # We can’t delete immediately; use conditional cleanup via X-Sendfile-like is not available,
+    # so we schedule cleanup by returning a file wrapper and removing dir after request finishes.
+    tmp_root = filepath.parent
 
-    return proxy_stream(direct_url, filename, content_type, referer=url)
+    try:
+        response = send_file(
+            path_or_file=str(filepath),
+            mimetype=mime,
+            as_attachment=True,
+            download_name=dl_name,
+            conditional=True,  # allows Range/If-Modified-Since handling by werkzeug
+            max_age=0,
+            etag=False,
+            last_modified=None,
+        )
+        # Make attachment explicit for the frontend parser that reads Content-Disposition
+        response.headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{dl_name}"
+        # Disable caching for safety
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    finally:
+        # Small delay to ensure the file handle is flushed/closed before cleanup on some servers
+        # (Render/Gunicorn should be fine without, but better safe than sorry)
+        try:
+            time.sleep(0.5)
+            _cleanup_dir(tmp_root)
+        except Exception:
+            pass
 
-@app.route('/static/<path:filename>')
-def serve_static(filename):
-    # Optional: serve auxiliary pages if you add them later
-    static_dir = os.path.join(app.root_path, 'static')
-    return send_from_directory(static_dir, filename)
+# =============================================================================
+# Entrypoint
+# =============================================================================
 
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host='0.0.0.0', port=port)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8000"))
+    # For local testing: flask’s dev server
+    app.run(host="0.0.0.0", port=port)
