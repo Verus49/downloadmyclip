@@ -1,4 +1,4 @@
-const BACKEND_URL = "https://REPLACE_WITH_YOUR_DOMAIN/upload_cookies";
+const BACKEND_URL = "https://downloadmyclip.onrender.com/upload_cookies";
 
 chrome.action.onClicked.addListener(async (tab) => {
   if (!tab.url) return;
