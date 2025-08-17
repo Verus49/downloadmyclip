@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "DownloadMyClip Cookie Helper",
+  "version": "1.0",
+  "description": "Send cookies from TikTok, YouTube, Instagram, and Facebook to DownloadMyClip.",
+  "permissions": [
+    "cookies",
+    "storage",
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://*.tiktok.com/*",
+    "https://*.youtube.com/*",
+    "https://*.instagram.com/*",
+    "https://*.facebook.com/*"
+  ],
+  "action": {
+    "default_title": "Send cookies to DownloadMyClip"
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}
